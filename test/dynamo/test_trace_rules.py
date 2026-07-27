@@ -342,28 +342,30 @@ class TraceRuleTests(torch._dynamo.test_case.TestCase):
 
     def test_gpu_manual_seed_functions_graph_break(self):
         cuda_functions = (
-            f"torch.{GPU_TYPE}.manual_seed",
-            f"torch.{GPU_TYPE}.manual_seed_all",
-            f"torch.{GPU_TYPE}.random.manual_seed",
-            f"torch.{GPU_TYPE}.random.manual_seed_all",
+            f"torch.cuda.manual_seed",
+            f"torch.cuda.manual_seed_all",
+            f"torch.cuda.random.manual_seed",
+            f"torch.cuda.random.manual_seed_all",
         )
 
         xpu_functions = (
-            f"torch.{GPU_TYPE}.manual_seed",
-            f"torch.{GPU_TYPE}.manual_seed_all",
+            f"torch.xpu.manual_seed",
+            f"torch.xpu.manual_seed_all",
         )
 
         if GPU_TYPE == "cuda":
             functions = cuda_functions
+            function_type = SkipFunctionVariable
         elif GPU_TYPE == "xpu":
             functions = xpu_functions
+            function_type = TorchInGraphFunctionVariable
         else:
             raise ValueError(f"Unsupported GPU_TYPE {GPU_TYPE}")
 
         for name in functions:
             self.assertIs(
                 torch._dynamo.trace_rules.lookup(load_object(name)),
-                SkipFunctionVariable,
+                function_type,
             )
 
     @unittest.skip("https://github.com/pytorch/pytorch/issues/114831")
