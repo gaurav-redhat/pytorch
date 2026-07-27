@@ -3036,25 +3036,59 @@ class TorchInGraphFunctionVariable(BaseTorchVariable):
                 Unsafe because y's grad_fn was consumed by autograd.grad. Trying to
                 backward through y later would error.
             """
-            from .. import compiled_autograd, config
+            from torch._higher_order_ops.wrap import (
+                tag_activation_checkpoint,
+                wrap_activation_checkpoint,
+            )
+
+            from .. import compiled_autograd
             from .builder import wrap_fx_proxy
             from .constant import ConstantVariable
             from .dicts import ConstDictVariable
             from .lists import BaseListVariable
             from .tensor import TensorVariable
 
-            if not config.trace_autograd_ops:
+            create_graph = args[4] if len(args) > 4 else kwargs.get("create_graph")
+            if (
+                not config.trace_autograd_ops
+                and isinstance(create_graph, ConstantVariable)
+                and bool(create_graph.value)
+            ):
                 unimplemented(
-                    gb_type="using `torch.autograd.grad` with `torch._dynamo.config.trace_autograd_ops=False`",
+                    gb_type="using `torch.autograd.grad(create_graph=True)` with `torch._dynamo.config.trace_autograd_ops=False`",
                     context=f"trace_autograd_ops={config.trace_autograd_ops}",
                     explanation=(
-                        "Attempted to call `torch.autograd.grad` with config "
-                        "`torch._dynamo.config.trace_autograd_ops` set to `False`."
+                        "Attempted to call `torch.autograd.grad` with "
+                        "`create_graph=True` while config "
+                        "`torch._dynamo.config.trace_autograd_ops` is `False`. "
+                        "Capturing higher-order autograd is still experimental."
                     ),
                     hints=[
                         "Change `torch._dynamo.config.trace_autograd_ops` to `True`.",
                     ],
                 )
+
+            tracer = tx.output.current_tracer
+            while tracer is not None:
+                if tracer.source_target in (
+                    tag_activation_checkpoint,
+                    wrap_activation_checkpoint,
+                ):
+                    unimplemented(
+                        gb_type="autograd.grad inside activation checkpoint",
+                        context="activation checkpoint body",
+                        explanation=(
+                            "torch.autograd.grad() cannot be safely captured inside "
+                            "torch.utils.checkpoint.checkpoint(). Checkpoint's caching "
+                            "dispatch modes do not support running backward while the "
+                            "checkpoint body is active."
+                        ),
+                        hints=[
+                            "Move the autograd.grad() call outside the checkpointed function.",
+                            *graph_break_hints.SUPPORTABLE,
+                        ],
+                    )
+                tracer = tracer.parent
 
             # Graph break if we detected on a previous attempt that autograd.grad
             # consumed grad_fns of returned tensors. This gives better compile
@@ -3192,8 +3226,7 @@ class TorchInGraphFunctionVariable(BaseTorchVariable):
             # (to detect returning tensors whose grad_fn was consumed by autograd.grad)
             # Skip if retain_graph=True or create_graph=True since the graph is not
             # consumed in those cases and can be traversed again.
-            retain_graph = kwargs.get("retain_graph")
-            create_graph = kwargs.get("create_graph")
+            retain_graph = args[3] if len(args) > 3 else kwargs.get("retain_graph")
             graph_preserved = (
                 isinstance(retain_graph, ConstantVariable)
                 and retain_graph.value is True

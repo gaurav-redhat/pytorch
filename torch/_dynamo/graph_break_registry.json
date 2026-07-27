@@ -2925,6 +2925,16 @@
       ]
     }
   ],
+  "GB2836": [
+    {
+      "Gb_type": "using `torch.autograd.grad(create_graph=True)` with `torch._dynamo.config.trace_autograd_ops=False`",
+      "Context": "trace_autograd_ops={config.trace_autograd_ops}",
+      "Explanation": "Attempted to call `torch.autograd.grad` with `create_graph=True` while config `torch._dynamo.config.trace_autograd_ops` is `False`. Capturing higher-order autograd is still experimental.",
+      "Hints": [
+        "Change `torch._dynamo.config.trace_autograd_ops` to `True`."
+      ]
+    }
+  ],
   "GB0192": [
     {
       "Gb_type": "input iterator to itertools.cycle has too many items",
@@ -5485,6 +5495,17 @@
       "Explanation": "Expected branches to return a possibly nested pytree of tensor or constant int/None leaves.",
       "Hints": [
         "Your code may result in an error when running in eager. Please double check that your code doesn't contain a similar error when actually running eager/uncompiled. You can do this by removing the `torch.compile` call, or by using `torch.compiler.set_stance(\"force_eager\")`. "
+      ]
+    }
+  ],
+  "GB9745": [
+    {
+      "Gb_type": "autograd.grad inside activation checkpoint",
+      "Context": "activation checkpoint body",
+      "Explanation": "torch.autograd.grad() cannot be safely captured inside torch.utils.checkpoint.checkpoint(). Checkpoint's caching dispatch modes do not support running backward while the checkpoint body is active.",
+      "Hints": [
+        "Move the autograd.grad() call outside the checkpointed function.",
+        "It may be possible to write Dynamo tracing rules for this code. Please report an issue to PyTorch if you encounter this graph break often and it is causing performance issues."
       ]
     }
   ],

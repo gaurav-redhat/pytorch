@@ -8,6 +8,7 @@ import torch
 import torch._dynamo
 from torch._dynamo.testing import (
     AotEagerAndRecordGraphs,
+    CompileCounterWithBackend,
     EagerAndRecordGraphs,
     normalize_gm,
 )
@@ -17,6 +18,143 @@ from torch.testing._internal.common_utils import (
     skipIfTorchDynamo,
     TestCase,
 )
+
+
+@skipIfTorchDynamo()
+class TestAutogradGradDefault(TestCase):
+    @skipIfCrossRef
+    def test_autograd_grad_manual_update_default(self):
+        mod_eager = torch.nn.Linear(4, 4)
+        mod_compiled = copy.deepcopy(mod_eager)
+        x = torch.randn(2, 4)
+
+        def step_fn(mod):
+            res = mod(x)
+            loss = res.sum()
+            params = tuple(mod.parameters())
+            param_grads = torch.autograd.grad(
+                loss, params, materialize_grads=False, allow_unused=True
+            )
+            for p, g_p in zip(params, param_grads):
+                if p.grad is None:
+                    p.grad = g_p
+                elif g_p is not None:
+                    p.grad.add_(g_p)
+            return loss.detach()
+
+        eager_loss = step_fn(mod_eager)
+
+        backend = AotEagerAndRecordGraphs()
+        compiled_step_fn = torch.compile(
+            lambda: step_fn(mod_compiled), backend=backend, fullgraph=True
+        )
+        compiled_loss = compiled_step_fn()
+
+        self.assertEqual(eager_loss, compiled_loss)
+        self.assertEqual(mod_eager.weight.grad, mod_compiled.weight.grad)
+        self.assertEqual(mod_eager.bias.grad, mod_compiled.bias.grad)
+        self.assertEqual(len(backend.graphs), 1)
+        self.assertTrue(
+            any(
+                node.target is torch.autograd.grad
+                for node in backend.graphs[0].graph.nodes
+            )
+        )
+
+    @skipIfCrossRef
+    def test_autograd_grad_default_rejects_external_grad_fn(self):
+        mod = torch.nn.Linear(4, 4)
+        x = torch.randn(2, 4)
+
+        @torch.compile(fullgraph=True, backend="aot_eager")
+        def step(res):
+            loss = res.sum()
+            params = tuple(mod.parameters())
+            return torch.autograd.grad(
+                loss, params, materialize_grads=False, allow_unused=True
+            )
+
+        with self.assertRaisesRegex(
+            torch._dynamo.exc.Unsupported,
+            "autograd.grad with external grad_fn",
+        ):
+            step(mod(x))
+
+    @skipIfCrossRef
+    def test_tensor_backward_still_gated_by_trace_autograd_ops(self):
+        mod = torch.nn.Linear(4, 4)
+        x = torch.randn(2, 4)
+
+        @torch.compile(fullgraph=True, backend="aot_eager")
+        def step():
+            loss = mod(x).sum()
+            loss.backward(inputs=list(mod.parameters()))
+            return loss.detach()
+
+        with self.assertRaisesRegex(
+            torch._dynamo.exc.Unsupported,
+            "trace_autograd_ops is off",
+        ):
+            step()
+
+    def test_autograd_grad_positional_create_graph_still_gated(self):
+        def fn(x):
+            return torch.autograd.grad(x.sin().sum(), x, None, None, True)[0]
+
+        x = torch.randn(4, requires_grad=True)
+        with self.assertRaisesRegex(
+            torch._dynamo.exc.Unsupported,
+            "Capturing higher-order autograd is still experimental",
+        ):
+            torch.compile(fn, backend="eager", fullgraph=True)(x)
+
+    def test_autograd_grad_positional_retain_graph_preserves_graph(self):
+        def fn(x):
+            y = x.sin()
+            grad = torch.autograd.grad(y.sum(), x, None, True)[0]
+            return y, grad
+
+        x_eager = torch.randn(4, requires_grad=True)
+        y_eager, grad_eager = fn(x_eager)
+        second_grad_eager = torch.autograd.grad(y_eager.sum(), x_eager)[0]
+
+        x_compiled = x_eager.detach().clone().requires_grad_()
+        y_compiled, grad_compiled = torch.compile(
+            fn, backend="aot_eager", fullgraph=True
+        )(x_compiled)
+        second_grad_compiled = torch.autograd.grad(y_compiled.sum(), x_compiled)[0]
+
+        self.assertEqual(y_compiled, y_eager)
+        self.assertEqual(grad_compiled, grad_eager)
+        self.assertEqual(second_grad_compiled, second_grad_eager)
+
+    def test_autograd_grad_inside_checkpoint_graph_breaks(self):
+        def checkpointed(x):
+            out = x.sin().exp().sin()
+            return torch.autograd.grad(out.sum(), x)[0]
+
+        def fn(x):
+            return torch.utils.checkpoint.checkpoint(
+                checkpointed, x.sin(), use_reentrant=False
+            ).cos()
+
+        x_eager = torch.randn(4, requires_grad=True)
+        expected = fn(x_eager)
+
+        x_compiled = x_eager.detach().clone().requires_grad_()
+        backend = CompileCounterWithBackend("eager")
+        actual = torch.compile(fn, backend=backend)(x_compiled)
+
+        self.assertEqual(actual, expected)
+        self.assertEqual(backend.frame_count, 2)
+        self.assertEqual(backend.op_count, 2)
+
+        torch._dynamo.reset()
+        with self.assertRaisesRegex(
+            torch._dynamo.exc.Unsupported,
+            "autograd.grad inside activation checkpoint",
+        ):
+            torch.compile(fn, backend="eager", fullgraph=True)(x_compiled)
 
 
 @torch._dynamo.config.patch(trace_autograd_ops=True)
