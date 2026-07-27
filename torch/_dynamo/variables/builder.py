@@ -25,6 +25,7 @@ import copy
 import dataclasses
 import enum
 import functools
+import gc
 import importlib.machinery
 import inspect
 import itertools
@@ -996,6 +997,18 @@ class VariableBuilder:
         )
 
     def wrap_mapping_proxy(self, value: Any) -> VariableTracker:
+        mapping_referents = gc.get_referents(value)
+        handle_dict_referents = gc.get_referents(
+            torch.utils.hooks.RemovableHandle.__dict__
+        )
+        if (
+            len(mapping_referents) == 1
+            and len(handle_dict_referents) == 1
+            and mapping_referents[0] is handle_dict_referents[0]
+        ):
+            self.tx.output.side_effects.observe_removable_handle_state(
+                f"mappingproxy source={self.source}"
+            )
         self.install_guards(GuardBuilder.TYPE_MATCH)
         # This might be suboptimal compared to dict guards. But mappingproxy is
         # not very common, so its ok to guard on all keys.
@@ -1167,6 +1180,16 @@ class VariableBuilder:
             )
             return self.tx.output.side_effects.track_object_existing(value, result)
         elif istype(value, (dict, collections.defaultdict, collections.OrderedDict)):
+            if self.tx.output.side_effects.is_pending_module_hook_state_object(value):
+                unimplemented(
+                    gb_type="pending module hook state alias read",
+                    context=f"source={self.source}",
+                    explanation=(
+                        "Dynamo cannot access an alias of nn.Module hook state after "
+                        "deferring a hook registration in the same forward."
+                    ),
+                    hints=[*graph_break_hints.SUPPORTABLE],
+                )
             self.install_guards(GuardBuilder.TYPE_MATCH)
             all_const = all(ConstantVariable.is_literal(k) for k in value)
 
