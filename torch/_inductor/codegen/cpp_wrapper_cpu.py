@@ -405,12 +405,7 @@ class CppWrapperCpu(PythonWrapperCodegen):
         if force_mutable or c_type.endswith("*"):
             return f"{array_expr}.data()"
 
-        # MSVC does not support implicitly converting a const iterator to a const
-        # pointer, so use data() and cast to keep const qualification.
-        if cpp_builder.is_msvc_cl():
-            return f"static_cast<const {c_type}*>({array_expr}.data())"
-
-        return f"{array_expr}.cbegin()"
+        return f"static_cast<const {c_type}*>({array_expr}.data())"
 
     def _generate_kernel_call_helper(
         self,
