@@ -1472,14 +1472,6 @@ class TensorVariable(VariableTracker):
 
         TODO: Support non-leaf tensors by fixing .grad access on non-leaf in Dynamo.
         """
-        if not config.trace_autograd_ops:
-            unimplemented(
-                gb_type="Unsupported Tensor.backward() call",
-                context=f"call_method {self} backward {gradient} {retain_graph} {create_graph} {inputs}",
-                explanation="Dynamo currently does not support tracing `Tensor.backward()` when trace_autograd_ops is off.",
-                hints=["Set torch._dynamo.trace_autograd_ops=True"],
-            )
-
         if not self.requires_grad and not self.has_grad_fn:
             raise TorchRuntimeError(
                 "tensor does not require grad and does not have a grad_fn"
@@ -1501,10 +1493,17 @@ class TensorVariable(VariableTracker):
             )
             input_vars = self._collect_backward_inputs(all_vars)
             if not input_vars:
-                # No leaf tensors found - nothing to accumulate gradients into.
-                # This matches eager behavior where backward() is a no-op if there
-                # are no leaves requiring grad.
-                return ConstantVariable.create(None)
+                unimplemented(
+                    gb_type="backward() with untracked leaf tensors",
+                    context=f"call_method {self} backward",
+                    explanation="Tensor.backward() cannot be captured because Dynamo "
+                    "cannot see the leaf tensors that receive gradients. This can "
+                    "happen when the autograd graph crosses a graph-break boundary.",
+                    hints=[
+                        "Move the backward() call into the same compiled region as "
+                        "the forward computation.",
+                    ],
+                )
         else:
             if isinstance(inputs, variables.BaseListVariable):
                 provided_vars = inputs.items
@@ -1540,7 +1539,14 @@ class TensorVariable(VariableTracker):
             grad_args.append(gradient)
 
         autograd_grad_fn = VariableTracker.build(tx, torch.autograd.grad)
-        grads_var = autograd_grad_fn.call_function(tx, grad_args, grad_kwargs)
+        if config.trace_autograd_ops:
+            grads_var = autograd_grad_fn.call_function(tx, grad_args, grad_kwargs)
+        else:
+            # Tensor.backward() lowers through the same autograd.grad handler, but
+            # direct user calls to autograd.grad should still honor the public
+            # trace_autograd_ops flag.
+            with config.patch(trace_autograd_ops=True):
+                grads_var = autograd_grad_fn.call_function(tx, grad_args, grad_kwargs)
 
         # Accumulate gradients for unique leaf tensors under no_grad context
         # to replicate eager autograd engine.

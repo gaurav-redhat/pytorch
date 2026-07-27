@@ -6024,6 +6024,17 @@
       ]
     }
   ],
+  "GB2897": [
+    {
+      "Gb_type": "backward() with untracked leaf tensors",
+      "Context": "call_method {self} backward",
+      "Explanation": "Tensor.backward() cannot be captured because Dynamo cannot see the leaf tensors that receive gradients. This can happen when the autograd graph crosses a graph-break boundary.",
+      "Hints": [
+        "Move the backward() call into the same compiled region as ",
+        "the forward computation."
+      ]
+    }
+  ],
   "GB0369": [
     {
       "Gb_type": "Frozen dataclass with missing field",
