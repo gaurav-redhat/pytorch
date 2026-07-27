@@ -342,15 +342,15 @@ class TraceRuleTests(torch._dynamo.test_case.TestCase):
 
     def test_gpu_manual_seed_functions_graph_break(self):
         cuda_functions = (
-            f"torch.cuda.manual_seed",
-            f"torch.cuda.manual_seed_all",
-            f"torch.cuda.random.manual_seed",
-            f"torch.cuda.random.manual_seed_all",
+            "torch.cuda.manual_seed",
+            "torch.cuda.manual_seed_all",
+            "torch.cuda.random.manual_seed",
+            "torch.cuda.random.manual_seed_all",
         )
 
         xpu_functions = (
-            f"torch.xpu.manual_seed",
-            f"torch.xpu.manual_seed_all",
+            "torch.xpu.manual_seed",
+            "torch.xpu.manual_seed_all",
         )
 
         if GPU_TYPE == "cuda":
