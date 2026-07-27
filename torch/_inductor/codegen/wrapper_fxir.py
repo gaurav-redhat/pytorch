@@ -83,6 +83,14 @@ aten = torch.ops.aten
 log = logging.getLogger(__name__)
 
 
+@torch.fx.node.has_side_effect
+def call_fallback_below_autograd(
+    op: Callable[..., Any], /, *args: Any, **kwargs: Any
+) -> Any:
+    with torch._C._AutoDispatchBelowADInplaceOrView():
+        return op(*args, **kwargs)
+
+
 @dataclasses.dataclass
 class SymbolBuffer(CodegenSymbol):
     """
@@ -944,10 +952,10 @@ class FxConverter:
         args: tuple[Any, ...] | None = None,
         kwargs: dict[str, Any] | None = None,
     ) -> None:
-        fx_node = self.gm.graph.call_function(
-            ir_node.op_overload,  # type: ignore[arg-type]
-            args=args,
-            kwargs=kwargs,
+        fx_node = self._call_fallback(
+            ir_node.op_overload,
+            args or (),
+            kwargs or {},
         )
         result_buffer = ir_node.codegen_reference()
         self.buffer_to_node[result_buffer] = fx_node
@@ -956,6 +964,24 @@ class FxConverter:
         # references to the mutated buffer see the post-mutation node.
         for mutated_name in ir_node.get_mutation_names():
             self.buffer_to_node[mutated_name] = fx_node
+
+    def _call_fallback(
+        self,
+        op: Callable[..., Any] | None,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+    ) -> torch.fx.Node:
+        if op is None:
+            raise AssertionError("Fallback kernel has no operator")
+        node = self.gm.graph.call_function(
+            call_fallback_below_autograd,
+            args=(op, *args),  # pyrefly: ignore [bad-argument-type]
+            kwargs=kwargs,
+        )
+        # Preserve this call target when GraphModule serialization reconstructs
+        # the graph through symbolic tracing.
+        node.meta["is_wrapped"] = True
+        return node
 
     def _generate_index_put_fallback(self, line: WrapperLine) -> None:
         if not isinstance(line, IndexPutFallbackLine):
@@ -1248,11 +1274,14 @@ class FxConverter:
         else:
             raise NotImplementedError(f"Unrecognized output layout: {kernel.layout}")
 
-        fx_node = self.gm.graph.call_function(
-            kernel.op_overload,  # type: ignore[arg-type]
-            args=args,
-            kwargs=kwargs,
-        )
+        if isinstance(kernel, (ir.FallbackKernel, ir.FallbackKernelOut)):
+            fx_node = self._call_fallback(kernel.op_overload, args, kwargs)
+        else:
+            fx_node = self.gm.graph.call_function(
+                kernel.op_overload,  # type: ignore[arg-type]
+                args=args,
+                kwargs=kwargs,
+            )
 
         # Assign the result to the given name.
         if result_buffer:
