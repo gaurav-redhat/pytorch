@@ -1685,6 +1685,21 @@ compile_worker_wait_timeout: int = int(
     os.environ.get("TORCHINDUCTOR_COMPILE_WORKER_WAIT_TIMEOUT", "0")
 )
 
+# Total memory budget (bytes) across all compile workers. 0 (the default)
+# means unlimited. The sidecar watchdog sums /proc/<pid> RSS for worker PIDs
+# from the heartbeat buffer and kills the largest consumer if over this limit.
+total_compile_worker_memory_limit: int = int(
+    os.environ.get("TORCHINDUCTOR_TOTAL_COMPILE_WORKER_MEMORY_LIMIT", "0")
+)
+
+# Wall-clock timeout (seconds) for a single kernel compilation inside a
+# compile worker. 0 (the default) means no per-kernel limit.
+# Distinct from compile_worker_wait_timeout, which only bounds how long the
+# parent waits on futures and does not stop the worker itself.
+compile_worker_per_kernel_timeout: int = int(
+    os.environ.get("TORCHINDUCTOR_COMPILE_WORKER_PER_KERNEL_TIMEOUT", "0")
+)
+
 enable_autograd_for_aot: bool = False
 
 

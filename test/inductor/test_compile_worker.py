@@ -518,6 +518,49 @@ class TestCompileWorkerWatchdog(TestCase):
         self.assertNotIn("phase", reports[-1])
         self.assertIn("elapsed_s", reports[-1])
 
+    @skipIfWindows(msg="pass_fds not supported on Windows.")
+    def test_per_kernel_timeout_kills_worker(self):
+        # A job that outlives compile_worker_per_kernel_timeout must be hard-killed
+        # by the sidecar watchdog (not just soft-waited in the parent).
+        with patch.dict(
+            os.environ,
+            {
+                "TORCHINDUCTOR_COMPILE_WORKER_WATCHDOG_INTERVAL": "1",
+                "TORCHINDUCTOR_COMPILE_WORKER_PER_KERNEL_TIMEOUT": "2",
+            },
+        ):
+            pool = SubprocPool(2)
+            try:
+                fut = pool.submit(time.sleep, 60)
+                with self.assertRaises(Exception):
+                    fut.result(timeout=30)
+                # Pool must recover after the kill (BrokenProcessPool recreate).
+                self.assertEqual(pool.submit(operator.add, 100, 1).result(), 101)
+            finally:
+                pool.shutdown()
+
+    @skipIfWindows(msg="pass_fds not supported on Windows.")
+    def test_total_memory_limit_kills_worker(self):
+        # A tiny total RSS budget forces the watchdog to kill a live worker once
+        # heartbeats have claimed slots (idle Python workers already exceed 1 byte).
+        with patch.dict(
+            os.environ,
+            {
+                "TORCHINDUCTOR_COMPILE_WORKER_WATCHDOG_INTERVAL": "1",
+                "TORCHINDUCTOR_TOTAL_COMPILE_WORKER_MEMORY_LIMIT": "1",
+            },
+        ):
+            pool = SubprocPool(1)
+            try:
+                # Warm so workers claim heartbeat slots (PIDs needed for RSS sum).
+                self.assertEqual(pool.submit(operator.add, 1, 2).result(), 3)
+                fut = pool.submit(time.sleep, 60)
+                with self.assertRaises(Exception):
+                    fut.result(timeout=30)
+                self.assertEqual(pool.submit(operator.add, 2, 3).result(), 5)
+            finally:
+                pool.shutdown()
+
 
 class TestTimer(TestCase):
     def test_basics(self):

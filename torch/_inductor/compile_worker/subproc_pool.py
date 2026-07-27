@@ -6,6 +6,7 @@ import logging
 import multiprocessing
 import os
 import pickle
+import signal
 import struct
 import subprocess
 import sys
@@ -702,18 +703,61 @@ class SubprocMain:
         # Every `interval` seconds, report any job still running past `interval`
         # so a stuck/slow worker leaves a breadcrumb (the parent turns these into
         # tlparse artifacts). Re-reports each tick with a growing elapsed time.
-        while not self._watchdog_stop.wait(interval):
+        # When per-kernel timeout / total memory limits are set, also enforce them
+        # by killing the offending worker; BrokenProcessPool recreates the pool.
+        memory_limit = config.total_compile_worker_memory_limit
+        timeout = config.compile_worker_per_kernel_timeout
+        poll = min(interval, timeout) if timeout > 0 else interval
+        while not self._watchdog_stop.wait(poll):
             now = time.monotonic()
             now_ns = time.monotonic_ns()
             heartbeats = watchdog.read_heartbeats()
+            if memory_limit > 0:
+                self._enforce_memory_limit(memory_limit)
             with self._inflight_lock:
-                slow = [
-                    (job_id, elapsed)
-                    for job_id, start in self._inflight.items()
-                    if (elapsed := now - start) >= interval
-                ]
+                slow = []
+                for job_id, start in self._inflight.items():
+                    elapsed = now - start
+                    if elapsed >= poll:
+                        slow.append((job_id, elapsed))
+                    if timeout > 0 and elapsed >= timeout:
+                        heartbeat = heartbeats.get(job_id)
+                        if heartbeat is not None:
+                            _, _, worker_pid = heartbeat
+                            os.kill(worker_pid, signal.SIGKILL)
+                            log.warning(
+                                "Compile worker %s timed out after %s seconds "
+                                "as job %s was running beyond compile worker "
+                                "per kernel timeout",
+                                worker_pid,
+                                elapsed,
+                                job_id,
+                            )
             for job_id, elapsed in slow:
                 self._report_status(job_id, elapsed, heartbeats.get(job_id), now_ns)
+
+    def _enforce_memory_limit(self, limit: int) -> None:
+        # PIDs come from the heartbeat buffer; RSS is read from /proc/<pid>.
+        usages = [(rss, pid) for pid, rss in watchdog.all_worker_rss()]
+        if not usages:
+            return
+        total = sum(rss for rss, _ in usages)
+        if total <= limit:
+            return
+        usages.sort(reverse=True)
+        rss, pid = usages[0]
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+        log.warning(
+            "Compile workers total RSS %s bytes exceeded limit %s; "
+            "killed worker pid %s (RSS %s bytes)",
+            total,
+            limit,
+            pid,
+            rss,
+        )
 
     def _report_status(
         self,

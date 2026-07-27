@@ -147,3 +147,32 @@ def read_heartbeats() -> dict[int, tuple[int, int, int]]:
                 _heartbeat[base + _F_PID],
             )
     return out
+
+
+def rss_bytes(pid: int) -> int:
+    """Sidecar: current RSS for ``pid`` in bytes, or 0 if unavailable."""
+    try:
+        # /proc/<pid>/statm: size resident shared text lib data dt (pages)
+        with open(f"/proc/{pid}/statm") as f:
+            resident_pages = int(f.read().split()[1])
+        return resident_pages * os.sysconf("SC_PAGE_SIZE")
+    except (OSError, IndexError, ValueError):
+        return 0
+
+
+def all_worker_rss() -> list[tuple[int, int]]:
+    """Sidecar: [(pid, rss_bytes), ...] for every claimed worker slot.
+
+    Uses PIDs already stored in the heartbeat buffer (including idle workers).
+    """
+    if _heartbeat is None:
+        return []
+    out: list[tuple[int, int]] = []
+    for s in range(_nprocs):
+        pid = int(_heartbeat[s * _FIELDS + _F_PID])
+        if pid <= 0:
+            continue
+        rss = rss_bytes(pid)
+        if rss > 0:
+            out.append((pid, rss))
+    return out
