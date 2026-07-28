@@ -2905,7 +2905,6 @@ class TMACompatibilityChecker:
     force: bool
     # Inductor buffer name being loaded from / stored to.
     buffer_name: str | None = None
-    _using_tdm: bool = dataclasses.field(init=False, default=False)
 
     def __post_init__(self):
         self.failed_debug_prefix = "Cannot use TMA descriptor for load / store since: "
@@ -2936,7 +2935,6 @@ class TMACompatibilityChecker:
             return True
 
         gfx1250_capable = use_gfx1250_descriptor_codegen(device)
-        self._using_tdm = gfx1250_capable
         cuda_xpu_capable = not gfx1250_capable and (
             (
                 (
@@ -3005,7 +3003,10 @@ class TMACompatibilityChecker:
             strides = block_params.strides
             constant_offset_expr = sympy.sympify(constant_offset)
 
-        if self._using_tdm:
+        using_tdm = use_gfx1250_descriptor_codegen(
+            V.graph.get_current_device_or_throw()
+        )
+        if using_tdm:
             if not 1 <= len(block_params.shape) <= 5:
                 return False
             int32_max = torch.iinfo(torch.int32).max
