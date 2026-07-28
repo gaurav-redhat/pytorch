@@ -353,14 +353,12 @@ class TraceRuleTests(torch._dynamo.test_case.TestCase):
             "torch.xpu.manual_seed_all",
         )
 
-        if GPU_TYPE == "cuda":
-            functions = cuda_functions
-            function_type = SkipFunctionVariable
-        elif GPU_TYPE == "xpu":
+        if GPU_TYPE == "xpu":
             functions = xpu_functions
             function_type = TorchInGraphFunctionVariable
         else:
-            raise ValueError(f"Unsupported GPU_TYPE {GPU_TYPE}")
+            functions = cuda_functions
+            function_type = SkipFunctionVariable
 
         for name in functions:
             self.assertIs(
