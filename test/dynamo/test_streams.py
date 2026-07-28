@@ -24,8 +24,8 @@ from torch.testing._internal.common_utils import (
     IS_MACOS,
     IS_WINDOWS,
     requires_cuda,
+    requires_xpu,
     TEST_WITH_ROCM,
-    TEST_XPU,
 )
 
 
@@ -2522,7 +2522,7 @@ class TestStreamsCUDASpecific(torch._dynamo.test_case.TestCase):
         self.assertEqual(actual_default, default_s.cuda_stream)
 
 
-@unittest.skipUnless(TEST_XPU, "xpu only")
+@requires_xpu
 class TestStreamsXPUSpecific(torch._dynamo.test_case.TestCase):
     def test_dynamo_registry_no_dangling_weakref(self):
         reset_user_object_tracking()
