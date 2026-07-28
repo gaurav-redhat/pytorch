@@ -1200,6 +1200,45 @@ class AutogradFunctionVariable(VariableTracker):
     ) -> "AutogradFunctionVariable":
         return AutogradFunctionVariable(self.fn_cls)
 
+    def getattro_impl(
+        self, tx: "InstructionTranslatorBase", name: str
+    ) -> VariableTracker:
+        source = AttrSource(self.source, name) if self.source is not None else None
+        if name == "apply":
+            return GetAttrVariable(self, name, py_type=types.MethodType, source=source)
+        if source is None:
+            return GetAttrVariable(self, name)
+
+        try:
+            obj = inspect.getattr_static(self.fn_cls, name)
+        except AttributeError:
+            unimplemented(
+                gb_type="Missing attribute on torch.autograd.Function subclass",
+                context=f"{self.fn_cls.__qualname__}.{name}",
+                explanation="Dynamo could not statically resolve an attribute "
+                "access on a torch.autograd.Function subclass.",
+                hints=[
+                    "Define the missing autograd.Function attribute before compiling."
+                ],
+            )
+
+        if isinstance(obj, staticmethod):
+            func = obj.__get__(self.fn_cls)
+            traced = trace_rules.lookup(func)
+            if traced is None:
+                raise AssertionError(f"trace_rules.lookup returned None for {func}")
+            if source is not None:
+                install_guard(source.make_guard(GuardBuilder.ID_MATCH))
+                # type: ignore[attr-defined]
+                return traced.create_with_source(func, source=source)
+            else:
+                # type: ignore[misc]
+                return traced(func)
+        elif isinstance(obj, classmethod):
+            return GetAttrVariable(self, name, py_type=types.MethodType, source=source)
+
+        return GetAttrVariable(self, name, source=source)
+
     def call_method(
         self,
         tx: "InstructionTranslatorBase",
@@ -1229,10 +1268,13 @@ class AutogradFunctionVariable(VariableTracker):
             return self.call_backward(tx, args, kwargs)
         else:
             source = AttrSource(self.source, name) if self.source is not None else None
-            try:
-                obj = inspect.getattr_static(self.fn_cls, name)
-            except AttributeError:
+            if source is None:
                 obj = None
+            else:
+                try:
+                    obj = inspect.getattr_static(self.fn_cls, name)
+                except AttributeError:
+                    obj = None
 
             if isinstance(obj, staticmethod):
                 func = obj.__get__(self.fn_cls)
@@ -1250,8 +1292,12 @@ class AutogradFunctionVariable(VariableTracker):
                     # type: ignore[misc]
                     return traced(func).call_function(tx, args, kwargs)
             elif isinstance(obj, classmethod):
+                func_source = AttrSource(source, "__func__") if source else None
+                if func_source:
+                    install_guard(func_source.make_guard(GuardBuilder.ID_MATCH))
+                    install_guard(func_source.make_guard(GuardBuilder.CLOSURE_MATCH))
                 return variables.UserMethodVariable(
-                    obj.__func__, self, source=source
+                    obj.__func__, self, source_fn=func_source, source=source
                 ).call_function(tx, args, kwargs)
             else:
                 unimplemented(
