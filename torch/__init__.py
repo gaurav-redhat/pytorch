@@ -24,6 +24,8 @@ import typing
 import typing_extensions
 import warnings
 from collections.abc import Callable as _Callable, Sequence as _Sequence
+from contextlib import contextmanager as _contextmanager
+from contextvars import ContextVar as _ContextVar
 from types import ModuleType as _ModuleType
 from typing import (
     Any as _Any,
@@ -2166,10 +2168,36 @@ def is_warn_always_enabled() -> builtins.bool:
 # equivalents. Their C++ equivalents are mentioned where applicable.
 
 
+_TORCH_CHECK_USER_ERROR = object()
+_torch_check_user_error_suppressed = _ContextVar(
+    "torch_check_user_error_suppressed", default=False
+)
+
+
+@_contextmanager
+def _suppress_torch_check_user_error() -> typing.Generator[None, None, None]:
+    """Prevent fake-only implementations from marking nested validation errors."""
+    token = _torch_check_user_error_suppressed.set(True)
+    try:
+        try:
+            yield
+        except RuntimeError as e:
+            if (
+                type(e) is RuntimeError
+                and e.__dict__.get("_torch_check_user_error") is _TORCH_CHECK_USER_ERROR
+            ):
+                del e.__dict__["_torch_check_user_error"]
+            raise
+    finally:
+        _torch_check_user_error_suppressed.reset(token)
+
+
 def _check_with(
     error_type: type[BaseException],
     cond: builtins.bool | SymBool,
     message: _LiteralString | _Callable[[], object] | None,
+    *,
+    _user_error: builtins.bool = False,
 ) -> None:
     if not isinstance(cond, (builtins.bool, SymBool)):
         if isinstance(cond, torch.Tensor):
@@ -2203,7 +2231,12 @@ def _check_with(
         # str/object; both are accepted.
         message_evaluated = str(message() if callable(message) else message)
 
-    raise error_type(message_evaluated)
+    error = error_type(message_evaluated)
+    if _user_error:
+        if type(error) is not RuntimeError:
+            raise AssertionError("_user_error requires an exact RuntimeError")
+        error.__dict__["_torch_check_user_error"] = _TORCH_CHECK_USER_ERROR
+    raise error
 
 
 def _check(
@@ -2226,6 +2259,19 @@ def _check(
             dynamically constructed message. Default: ``None``
     """
     _check_with(RuntimeError, cond, message)
+
+
+def _check_user_error(
+    cond: builtins.bool | SymBool,
+    message: _LiteralString | _Callable[[], object] | None = None,
+) -> None:
+    """Core-only check for audited validation errors that mirror eager."""
+    _check_with(
+        RuntimeError,
+        cond,
+        message,
+        _user_error=not _torch_check_user_error_suppressed.get(),
+    )
 
 
 @_deprecated(
