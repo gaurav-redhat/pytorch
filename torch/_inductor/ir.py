@@ -9318,12 +9318,12 @@ class AssertScalar(ExternKernel):
         # "u0 == 0" in the runtime asserts, if you subsequently try to
         # simplify(u0 == 0), you will get True (because we've already runtime assert'ed
         # that it's true).  But we're code generating the actual runtime assert here!!
-        symbol = next(iter(self.get_free_symbol_uses(unbacked_only=False)))
         if V.graph.fx_wrapper:
             # TODO fix
             pass
         elif V.graph.cpp_wrapper:
-            symbol_str = f"std::to_string({symbol})"
+            symbol = next(iter(self.get_free_symbol_uses(unbacked_only=False)), None)
+            symbol_str = f"std::to_string({symbol})" if symbol is not None else '""'
             sizevar = V.graph.wrapper_code.codegen_cpp_sizevar(
                 self.scalar, simplify=False
             )
@@ -10998,6 +10998,30 @@ class Switch(ExternKernel):
                 # Symbolic integer or constant - pass directly
                 fake_operands.append(fx_op)
         fake_outputs = V.graph.current_node.meta["val"]
+        fx_pred = V.graph.current_node.args[0]
+        if isinstance(fx_pred, Node):
+            fake_pred = fx_pred.meta["val"]
+        else:
+            fake_pred = fx_pred
+
+        def _branch_refinement_context(
+            shape_env: ShapeEnv, branch: bool | None
+        ) -> AbstractContextManager[None]:
+            if branch is None or not isinstance(fake_pred, torch.SymBool):
+                return shape_env.branch_local_shape_refinement(allow_eager_checks=False)
+
+            @contextlib.contextmanager
+            def ctx() -> Generator[None, None, None]:
+                with shape_env.branch_local_shape_refinement():
+                    expr = (
+                        fake_pred.node.expr
+                        if branch
+                        else sympy.Not(fake_pred.node.expr)
+                    )
+                    shape_env._assume_branch_local_shape_expr(expr)
+                    yield
+
+            return ctx()
 
         def _require_exact_strides(
             graph_outputs: Sequence[IRNode],
@@ -11026,7 +11050,14 @@ class Switch(ExternKernel):
             # pyrefly: ignore [bad-return]
             return ret
 
-        for subgraph in branches:
+        # Cond branches are stored as [false, true] for selector-based codegen,
+        # but lower true first so its unconstrained input layout remains the
+        # parent graph's template. Switch branches use their natural order.
+        branch_indices = (
+            range(len(branches) - 1, -1, -1) if is_cond else range(len(branches))
+        )
+        for branch_index in branch_indices:
+            subgraph = branches[branch_index]
             if subgraph.graph is None:
                 # create and lower subgraphs
                 subgraph.graph = V.graph.make_subgraph(
@@ -11041,7 +11072,11 @@ class Switch(ExternKernel):
                     a.meta["val"] if isinstance(a, Node) else a for a in branch_out_args
                 ]
                 with V.set_graph_handler(subgraph.graph):
-                    subgraph.graph.run(*fake_operands)
+                    with _branch_refinement_context(
+                        subgraph.graph.sizevars.shape_env,
+                        branch_index == 1 if is_cond else None,
+                    ):
+                        subgraph.graph.run(*fake_operands)
                     # Force subgraph outputs to the expected strides from
                     # FakeTensor metadata. Branches share the merged strides
                     # unless those carry an unbacked symbol (mismatched inner

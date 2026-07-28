@@ -2182,6 +2182,15 @@ def _check_with(
 
     from torch.fx.experimental.symbolic_shapes import expect_true
 
+    if isinstance(cond, SymBool):
+        shape_env = cond.node.shape_env
+        if (
+            shape_env is not None
+            and shape_env._has_branch_local_shape_refinement_for_eager_checks()
+        ):
+            shape_env._assume_branch_local_shape_expr(cond.node.expr)
+            return
+
     if expect_true(cond):
         return
 
