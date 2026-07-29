@@ -28,8 +28,7 @@ from torch._dynamo.variables import (
     TorchInGraphFunctionVariable,
     UserFunctionVariable,
 )
-from torch.testing._internal.common_device_type import onlyOn
-from torch.testing._internal.common_utils import skipIfWindows
+from torch.testing._internal.common_utils import skipIfWindows, TEST_CUDA, TEST_XPU
 from torch.testing._internal.inductor_utils import GPU_TYPE
 
 
@@ -341,7 +340,7 @@ class TraceRuleTests(torch._dynamo.test_case.TestCase):
                     "is not a python module, please check and correct it.",
                 )
 
-    @onlyOn(["cuda", "xpu"])
+    @unittest.skipUnless(TEST_XPU or TEST_CUDA, "GPU is not available")
     def test_gpu_manual_seed_functions_graph_break(self):
         for name in (
             f"torch.{GPU_TYPE}.manual_seed",
