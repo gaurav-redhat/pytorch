@@ -6170,12 +6170,71 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         if not is_float8:
             self.compute.writeline(f"{', '.join(part_names)} = tl.split({reshaped})")
             return
-        raw_part_names = [f"{name}_uint8" for name in part_names]
-        self.compute.writeline(f"{', '.join(raw_part_names)} = tl.split({reshaped})")
-        for raw_name, part_name in zip(raw_part_names, part_names):
+        raw_parts = tuple(
+            self.cse.newvar(dtype=torch.uint8, shape=reshape_shape[:-1])
+            for _ in part_names
+        )
+        self.compute.writeline(
+            f"{', '.join(map(str, raw_parts))} = tl.split({reshaped})"
+        )
+        for raw_part, part_name in zip(raw_parts, part_names):
             self.compute.writeline(
-                f"{part_name} = {raw_name}.to({triton_type(dtype)}, bitcast=True)"
+                f"{part_name} = {raw_part}.to({triton_type(dtype)}, bitcast=True)"
             )
+
+    def emit_split_via_reshape_permute(
+        self,
+        value: CSEVariable,
+        reshape_shape: Sequence[sympy.Expr | int | str],
+        permute_dims: Sequence[int],
+        part_names: Sequence[str],
+    ) -> None:
+        dtype = value.dtype
+        assert dtype is not None  # noqa: S101
+        is_float8 = dtype in TRITON_FLOAT8_DTYPES
+        value_expr = str(value)
+        if is_float8:
+            value_expr = f"{value_expr}.to(tl.uint8, bitcast=True)"
+        reshaped = self._reshape_expr(value, reshape_shape, value_expr=value_expr)
+        permuted = f"tl.permute({reshaped}, ({', '.join(map(str, permute_dims))}))"
+        factor = len(part_names)
+        assert factor > 1 and factor & (factor - 1) == 0  # noqa: S101
+        permuted_shape = tuple(reshape_shape[i] for i in permute_dims)
+        split_dtype = torch.uint8 if is_float8 else dtype
+
+        def emit_recursive_split(
+            expr: str,
+            names: Sequence[str],
+            shape: Sequence[sympy.Expr | int | str],
+        ) -> None:
+            if len(names) == 2:
+                if not is_float8:
+                    self.compute.writeline(f"{', '.join(names)} = tl.split({expr})")
+                    return
+                raw_parts = tuple(
+                    self.cse.newvar(dtype=torch.uint8, shape=shape[:-1]) for _ in names
+                )
+                self.compute.writeline(
+                    f"{', '.join(map(str, raw_parts))} = tl.split({expr})"
+                )
+                for raw_part, name in zip(raw_parts, names):
+                    self.compute.writeline(
+                        f"{name} = {raw_part}.to({triton_type(dtype)}, bitcast=True)"
+                    )
+                return
+            half = len(names) // 2
+            split_shape = (*shape[:-1], half, 2)
+            part_shape = (*shape[:-1], half)
+            even = self.cse.newvar(dtype=split_dtype, shape=part_shape)
+            odd = self.cse.newvar(dtype=split_dtype, shape=part_shape)
+            self.compute.writeline(
+                f"{even}, {odd} = tl.split("
+                f"tl.reshape({expr}, {triton_shape_str(split_shape)}))"
+            )
+            emit_recursive_split(str(even), names[0::2], part_shape)
+            emit_recursive_split(str(odd), names[1::2], part_shape)
+
+        emit_recursive_split(permuted, part_names, permuted_shape)
 
     def emit_broadcast_via_reshape(
         self,
