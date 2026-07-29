@@ -3,18 +3,110 @@
 #include <c10/cuda/CUDADeviceAssertionHost.h>
 #include <c10/util/Exception.h>
 
+#if !defined(USE_ROCM) && defined(PYTORCH_C10_DRIVER_API_SUPPORTED)
+#include <c10/cuda/driver_api.h>
+#endif
+
+#include <algorithm>
+#include <array>
+#include <cstring>
 #include <string>
 #include <utility>
 
 namespace c10::cuda {
+
+namespace {
+
+#if !defined(USE_ROCM) && defined(PYTORCH_C10_DRIVER_API_SUPPORTED) && \
+    defined(CUDA_VERSION) && (CUDA_VERSION >= 12090)
+// This size matches the one used by cuLogsDumpToMemory, however we could shrink
+// it as in our case this size is per-thread, and it only needs to be large
+// enough to contain the messages printed by a single CUDA function call.
+constexpr size_t kCUDAErrorLogBufferSize = 25600;
+
+struct CUDAErrorLogBuffer {
+  std::array<char, kCUDAErrorLogBufferSize> data{};
+  size_t length{0};
+};
+
+thread_local CUDAErrorLogBuffer cuda_error_log_buffer;
+
+void CUDA_CB cuda_error_log_callback(
+    void*,
+    CUlogLevel,
+    char* message,
+    size_t length) noexcept {
+  auto& buffer = cuda_error_log_buffer;
+  const auto copy_size = std::min(length, buffer.data.size() - buffer.length);
+  if (copy_size > 0) {
+    std::memcpy(buffer.data.data() + buffer.length, message, copy_size);
+  }
+  buffer.length += copy_size;
+  if (length > 0 && copy_size == length && buffer.length < buffer.data.size() &&
+      message[length - 1] != '\n') {
+    buffer.data[buffer.length++] = '\n';
+  }
+}
+
+bool register_cuda_error_log_callback() noexcept {
+  try {
+    auto* api = DriverAPI::get();
+    return api->cuLogsRegisterCallback_ &&
+        api->cuLogsRegisterCallback_(
+            cuda_error_log_callback, nullptr, nullptr) == CUDA_SUCCESS;
+  } catch (...) {
+    return false;
+  }
+}
+#endif
+
+} // namespace
+
+CUDAErrorLogCapture::CUDAErrorLogCapture() noexcept {
+#if !defined(USE_ROCM) && defined(PYTORCH_C10_DRIVER_API_SUPPORTED) && \
+    defined(CUDA_VERSION) && (CUDA_VERSION >= 12090)
+  static const bool callback_registered [[maybe_unused]] =
+      register_cuda_error_log_callback();
+  cuda_error_log_buffer.length = 0;
+#endif
+}
+
+std::string CUDAErrorLogCapture::get_error_log_suffix() noexcept {
+#if !defined(USE_ROCM) && defined(PYTORCH_C10_DRIVER_API_SUPPORTED) && \
+    defined(CUDA_VERSION) && (CUDA_VERSION >= 12090)
+  auto& buffer = cuda_error_log_buffer;
+  const auto length = buffer.length;
+  buffer.length = 0;
+  if (length == 0) {
+    return {};
+  }
+
+  try {
+    std::string error_log{
+        "\nThe CUDA driver logged these messages, which may provide useful details:\n"};
+    error_log.append(buffer.data.data(), length);
+    return error_log;
+  } catch (...) {
+    return {};
+  }
+#else
+  return {};
+#endif
+}
 
 void c10_cuda_check_implementation(
     const int32_t err,
     const char* filename,
     const char* function_name,
     const uint32_t line_number,
-    const bool include_device_assertions) {
+    const bool include_device_assertions,
+    CUDAErrorLogCapture* error_log) {
   const auto cuda_error = static_cast<cudaError_t>(err);
+#ifndef STRIP_ERROR_MESSAGES
+  const auto error_log_suffix = cuda_error != cudaSuccess && error_log
+      ? error_log->get_error_log_suffix()
+      : std::string{};
+#endif
   const auto cuda_kernel_failure = include_device_assertions
       ? c10::cuda::CUDAKernelLaunchRegistry::get_singleton_ref().has_failed()
       : false;
@@ -32,6 +124,7 @@ void c10_cuda_check_implementation(
   check_message.append(error_string);
   check_message.append(c10::cuda::get_cuda_error_help(cuda_error));
   check_message.append(c10::cuda::get_cuda_async_error_suffix(cuda_error));
+  check_message.append(error_log_suffix);
   check_message.push_back('\n');
   if (include_device_assertions) {
     check_message.append(c10_retrieve_device_side_assertion_info());
