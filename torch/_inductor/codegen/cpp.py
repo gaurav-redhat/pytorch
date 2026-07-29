@@ -3479,6 +3479,17 @@ class CppVecKernel(CppKernel):
                     if reduction_type != "sum":
                         raise AssertionError('expected reduction_type == "sum"')
                     result_vec = f"{acc_vec} + {masked_acc_vec}"
+                if self._get_raw_num_vectors(vec_dtype) < 1:
+                    # For dtypes smaller than the vector lane width (e.g.
+                    # uint8/int8 with float-sized tiling factor), loads fill
+                    # only the first tiling_factor lanes and zero the rest, so
+                    # the inactive accumulator lanes must be reset to the
+                    # reduction identity before reducing across all lanes.
+                    result_vec = (
+                        f"{self._get_vec_type(vec_dtype)}::set("
+                        f"{self.reduction_init_vec(reduction_type, dtype)}, "
+                        f"{result_vec}, {self.tiling_factor})"
+                    )
                 next_value = f"{vec_reduce_all_func}([]({vec}& x, {vec}& y) {reduce_all_body}, {result_vec})"
 
             self.reduction_suffix.writeline(

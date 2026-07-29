@@ -7413,6 +7413,24 @@ class CPUReproTests(TestCase):
                 # inf or finite numbers, it shouldn't degrade into unexpected NaNs).
                 self.assertEqual(eager_out, compiled_out)
 
+    @requires_vectorization
+    @parametrize("dtype", (torch.uint8, torch.int8))
+    def test_int8_min_max_reduction(self, dtype):
+        # https://github.com/pytorch/pytorch/issues/191499
+        # Partial vector loads of int8/uint8 fill only the first tiling-factor
+        # lanes of the reduction accumulator; the inactive lanes used to leak
+        # zeros into the horizontal min/max.
+        def fn(x):
+            return torch.amin(x), torch.amax(x), torch.aminmax(x)
+
+        low, high = (5, 100) if dtype == torch.uint8 else (-100, -5)
+        for size in (4, 64, 129):
+            torch._dynamo.reset()
+            metrics.reset()
+            x = torch.randint(low, high, (size,), dtype=dtype)
+            self.common(fn, (x,))
+        check_metrics_vec_kernel_count(1)
+
     def test_cpu_realization_thresholds(self):
         from torch._inductor.ir import Pointwise, StorageBox
         from torch._inductor.virtualized import ops
