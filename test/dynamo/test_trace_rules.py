@@ -30,6 +30,7 @@ from torch._dynamo.variables import (
 )
 from torch.testing._internal.common_utils import skipIfWindows
 from torch.testing._internal.inductor_utils import GPU_TYPE
+from torch.testing._internal.common_device_type import onlyOn
 
 
 try:
@@ -340,6 +341,7 @@ class TraceRuleTests(torch._dynamo.test_case.TestCase):
                     "is not a python module, please check and correct it.",
                 )
 
+    @onlyOn(["cuda", "xpu"])
     def test_gpu_manual_seed_functions_graph_break(self):
         for name in (
             f"torch.{GPU_TYPE}.manual_seed",
