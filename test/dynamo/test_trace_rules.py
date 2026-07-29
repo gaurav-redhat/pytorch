@@ -28,9 +28,9 @@ from torch._dynamo.variables import (
     TorchInGraphFunctionVariable,
     UserFunctionVariable,
 )
+from torch.testing._internal.common_device_type import onlyOn
 from torch.testing._internal.common_utils import skipIfWindows
 from torch.testing._internal.inductor_utils import GPU_TYPE
-from torch.testing._internal.common_device_type import onlyOn
 
 
 try:
