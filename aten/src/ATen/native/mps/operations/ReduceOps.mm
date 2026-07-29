@@ -847,11 +847,11 @@ static void argmax_argmin_out_mps(const Tensor& input_t,
 // Unified host-side dispatch for value-preserving reductions on MPS, shared
 // by sum/nansum/mean/count_nonzero and min/max/all/any. Kernel name pattern
 // is always `{prefix}reduction_{variant}_{TI}_{TO}` with variant in
-// `""/"outer"/"inner"/"flat"/"strided"`; every op/dtype pair with a base
-// kernel also has the flat and strided variants. Selects among four code
-// paths:
-//   1. Outer-dim kernel (dim=0 on contiguous input).
-//   2. Inner-dim kernel (last dim on contiguous input).
+// `""/"outer"/"inner"/"inner_chunk"/"flat"/"strided"`; every op/dtype pair
+// with a base kernel also has every variant. Selects among these code paths:
+//   1. Last-dim reduction on contiguous input: inner_chunk for short rows,
+//      split-K two-pass for skinny-M/huge-K, inner otherwise.
+//   2. Outer-dim kernel (dim=0 on contiguous input).
 //   3. Two-pass full reduction (scalar output, large input).
 //   4. Generic single-pass fallback.
 struct ReductionDispatch {
@@ -897,6 +897,80 @@ static void reduction_dispatch_mps(TensorIterator& iter, const ReductionDispatch
   const auto out_str = scalarToMetalTypeString(opts.output_kernel_dtype);
   const auto partial_str = scalarToMetalTypeString(opts.partial_dtype);
 
+  auto encode_inner = [&](const Tensor& in,
+                          const Tensor& out,
+                          uint32_t num_rows,
+                          uint32_t row_len,
+                          const std::string& prefix,
+                          ScalarType in_dt,
+                          ScalarType out_dt,
+                          std::optional<float> divisor) {
+    auto kname =
+        fmt::format("{}reduction_inner_{}_{}", prefix, scalarToMetalTypeString(in_dt), scalarToMetalTypeString(out_dt));
+    constexpr uint32_t TG_SIZE = 256;
+    const auto num_tgs = c10::metal::ceil_div(num_rows, TG_SIZE / 32);
+    id<MTLComputeCommandEncoder> ce = stream->commandEncoder();
+    auto ps = lib.getPipelineStateForFunc(kname);
+    getMPSProfiler().beginProfileKernel(ps, prefix + "reduction_inner", {in});
+    [ce setComputePipelineState:ps];
+    const std::array<uint32_t, 2> sizes_s{num_rows, row_len};
+    if (divisor.has_value()) {
+      mtl_setArgs(ce, in, out, sizes_s, *divisor);
+    } else {
+      mtl_setArgs(ce, in, out, sizes_s);
+    }
+    [ce dispatchThreads:MTLSizeMake(num_tgs * TG_SIZE, 1, 1) threadsPerThreadgroup:MTLSizeMake(TG_SIZE, 1, 1)];
+    getMPSProfiler().endProfileKernel(ps);
+  };
+  // Smallest power-of-two lane count keeping at most 16 elements per lane;
+  // the chunk kernel then packs 32 / lanes rows into one simdgroup instead
+  // of letting a short row idle most of its 32 lanes.
+  auto pick_lanes = [](uint32_t row_len) -> uint32_t {
+    uint32_t lanes = 1;
+    while (lanes < 32u && c10::metal::ceil_div(row_len, lanes) > 16u) {
+      lanes *= 2;
+    }
+    return lanes;
+  };
+  auto encode_chunk = [&](const Tensor& in,
+                          const Tensor& out,
+                          uint32_t num_rows,
+                          uint32_t row_len,
+                          uint32_t lanes,
+                          uint32_t segments,
+                          const std::string& prefix,
+                          ScalarType in_dt,
+                          ScalarType out_dt,
+                          std::optional<float> divisor) {
+    auto kname = fmt::format(
+        "{}reduction_inner_chunk_{}_{}", prefix, scalarToMetalTypeString(in_dt), scalarToMetalTypeString(out_dt));
+    constexpr uint32_t TG_SIZE = 256;
+    const auto rows_per_simd = 32u / lanes;
+    const auto total_simds = c10::metal::ceil_div(num_rows * segments, rows_per_simd);
+    const auto num_tgs = c10::metal::ceil_div(total_simds, TG_SIZE / 32);
+    id<MTLComputeCommandEncoder> ce = stream->commandEncoder();
+    auto ps = lib.getPipelineStateForFunc(kname);
+    getMPSProfiler().beginProfileKernel(ps, prefix + "reduction_inner_chunk", {in});
+    [ce setComputePipelineState:ps];
+    const std::array<uint32_t, 4> sizes_s{num_rows, row_len, lanes, segments};
+    if (divisor.has_value()) {
+      mtl_setArgs(ce, in, out, sizes_s, *divisor);
+    } else {
+      mtl_setArgs(ce, in, out, sizes_s);
+    }
+    [ce dispatchThreads:MTLSizeMake(num_tgs * TG_SIZE, 1, 1) threadsPerThreadgroup:MTLSizeMake(TG_SIZE, 1, 1)];
+    getMPSProfiler().endProfileKernel(ps);
+  };
+  // Segments per row for split-K: aim for ~8192 partials (rows * segments)
+  // so pass 1 fills the GPU, cap so a segment keeps >= 64 elements, then
+  // round so the segments come out equal-sized.
+  auto pick_split_segments = [](uint32_t num_rows, uint32_t row_len) -> uint32_t {
+    const auto max_segs = std::min<uint32_t>(2048u, c10::metal::ceil_div(row_len, 64u));
+    const auto segs =
+        std::clamp<uint32_t>(c10::metal::ceil_div(8192u, std::max(num_rows, 1u)), 2u, std::max(max_segs, 2u));
+    return c10::metal::ceil_div(row_len, c10::metal::ceil_div(row_len, segs));
+  };
+
   // Outer-dim (dim=0 on contiguous input) and inner-dim (last dim on
   // contiguous input) specializations: handle the dim-reduction case with
   // dedicated kernels that have better thread layout than the generic kernel.
@@ -937,28 +1011,76 @@ static void reduction_dispatch_mps(TensorIterator& iter, const ReductionDispatch
       return;
     }
     if (num_reduced == 1 && reduced_dim == input_orig.dim() - 1) {
-      uint32_t N = input_orig.size(input_orig.dim() - 1);
-      uint32_t M = input_orig.numel() / N;
-      auto inner_kernel = fmt::format("{}reduction_inner_{}_{}", opts.prefix, in_str, out_str);
-      constexpr uint32_t TG_SIZE = 256;
-      constexpr uint32_t rows_per_tg = TG_SIZE / 32;
-      const auto num_tgs = c10::metal::ceil_div(M, rows_per_tg);
+      const auto row_len = static_cast<uint32_t>(input_orig.size(input_orig.dim() - 1));
+      const auto num_rows = static_cast<uint32_t>(input_orig.numel() / row_len);
+      // The chunk kernels index in uint32.
+      const bool fits_u32 = input_orig.numel() <= static_cast<int64_t>(std::numeric_limits<uint32_t>::max());
+      // Two-pass paths divide on the final pass only, while the accumulator
+      // is still in opmath_t; sum-family kernels always take the divisor
+      // buffer, so pass 1 binds a no-op 0 (value ops take none).
+      const std::optional<float> p1_div = opts.divisor.has_value() ? std::optional<float>(0.0f) : std::nullopt;
+      // Tensors too small to fill the GPU gain nothing from packing rows
+      // into simdgroups; keep them on the inner kernel below (the pre-chunk
+      // routing, whose enqueue floor measures ~10% lower there).
+      const bool tiny = static_cast<int64_t>(num_rows) * row_len < 65536;
+      if (row_len <= 256u && !tiny && fits_u32) {
+        dispatch_sync_with_rethrow(stream->queue(), ^() {
+          @autoreleasepool {
+            encode_chunk(input_orig,
+                         output,
+                         num_rows,
+                         row_len,
+                         pick_lanes(row_len),
+                         1u,
+                         opts.prefix,
+                         opts.input_kernel_dtype,
+                         opts.output_kernel_dtype,
+                         opts.divisor);
+          }
+        });
+        return;
+      }
+      // Skinny-M/huge-K: one simdgroup per row (8 per threadgroup) would
+      // leave the GPU under-occupied below 64 threadgroups, so split each
+      // row into segments and fold the [num_rows, num_segs] partials in
+      // pass 2.
+      if (c10::metal::ceil_div(num_rows, 8u) < 64u && row_len >= 2048u && fits_u32) {
+        const auto num_segs = pick_split_segments(num_rows, row_len);
+        auto partials = at::empty({(int64_t)num_rows, (int64_t)num_segs}, output.options().dtype(opts.partial_dtype));
+        dispatch_sync_with_rethrow(stream->queue(), ^() {
+          @autoreleasepool {
+            encode_chunk(input_orig,
+                         partials,
+                         num_rows,
+                         row_len,
+                         32u,
+                         num_segs,
+                         opts.prefix,
+                         opts.input_kernel_dtype,
+                         opts.partial_dtype,
+                         p1_div);
+            encode_inner(partials,
+                         output,
+                         num_rows,
+                         num_segs,
+                         opts.pass2_prefix,
+                         opts.partial_dtype,
+                         opts.output_kernel_dtype,
+                         opts.divisor);
+          }
+        });
+        return;
+      }
       dispatch_sync_with_rethrow(stream->queue(), ^() {
         @autoreleasepool {
-          id<MTLComputeCommandEncoder> ce = stream->commandEncoder();
-          auto ps = lib.getPipelineStateForFunc(inner_kernel);
-          getMPSProfiler().beginProfileKernel(ps, opts.prefix + "reduction_inner", {input_orig});
-          struct {
-            uint32_t M, N;
-          } sizes_s = {M, N};
-          [ce setComputePipelineState:ps];
-          if (opts.divisor.has_value()) {
-            mtl_setArgs(ce, input_orig, output, sizes_s, *opts.divisor);
-          } else {
-            mtl_setArgs(ce, input_orig, output, sizes_s);
-          }
-          [ce dispatchThreads:MTLSizeMake(num_tgs * TG_SIZE, 1, 1) threadsPerThreadgroup:MTLSizeMake(TG_SIZE, 1, 1)];
-          getMPSProfiler().endProfileKernel(ps);
+          encode_inner(input_orig,
+                       output,
+                       num_rows,
+                       row_len,
+                       opts.prefix,
+                       opts.input_kernel_dtype,
+                       opts.output_kernel_dtype,
+                       opts.divisor);
         }
       });
       return;
