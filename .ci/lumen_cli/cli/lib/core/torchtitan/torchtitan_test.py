@@ -41,9 +41,12 @@ class TorchtitanTestRunner(BaseRunner):
     def prepare(self):
         clone_torchtitan(dst=self.work_directory)
         # torchao and torchcomms nightlies are required by torchtitan
+        # but their wheel metadata pins torch nightlies. Do not let pip replace
+        # the PyTorch wheel built by this CI job.
         pip_install_packages(
             packages=[
                 "--pre",
+                "--no-deps",
                 "torchao",
                 "torchcomms",
                 "--index-url",
